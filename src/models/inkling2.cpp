@@ -1,6 +1,8 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <cstdlib>
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -400,11 +402,29 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_build_forward_expand(gf, Rcur);
         ggml_build_forward_expand(gf, sinks);
 
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        // LOCAL (LLAMA_KV_DEVICES): when this layer's KV cache (and so its attention) is on another device, build the
+        // bias table there: only Rcur, the sinks and the tiny rel-bias weight cross, not the ~200 MB table
+        ggml_backend_t kv_backend = nullptr;
+        if (model.dev_kv(il) != model.dev_layer(il)) {
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(b) == model.dev_kv(il)) { kv_backend = b; break; }
+            }
+        }
+        auto pin = [&](ggml_tensor * t) {
+            if (kv_backend) { ggml_backend_sched_set_tensor_backend(sched, t, kv_backend); }
+            return t;
+        };
+
+        ggml_tensor * table = pin(ggml_mul_mat(ctx0, pin(ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0)), Rcur));
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, sinks);
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        table = pin(ggml_sub(ctx0, table, sinks));
+        // LOCAL: keep the native bins-fastest layout [n_bins, n_head, n_tokens]: the CUDA flash attention reads it
+        // contiguously along the cells; build_attn_mha transposes it only for the dense (few-token / fallback) mask
+        if (getenv("LLAMA_INKLING_BIAS_HEADS_FASTEST")) {   // A/B switch for tests
+            table = pin(ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)));
+        }
 
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 

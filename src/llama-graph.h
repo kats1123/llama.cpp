@@ -805,6 +805,9 @@ public:
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    // LOCAL (Inkling 2): positional mode, the CUDA flash attention builds mask + bias from pos_info;
+    // self_rel_pos(_swa) are then I32 [2, n_kv + n_batch] pos_info and the masks are placeholders
+    bool positional = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1343,7 +1346,9 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * bias_table = nullptr,
-            ggml_tensor * bias_indices = nullptr) const;
+            ggml_tensor * bias_indices = nullptr,
+                int32_t   bias_extent = -1,   // LOCAL: >= 0 = positional bias (bias_indices is pos_info)
+                int32_t   bias_n_swa  = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

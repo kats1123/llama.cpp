@@ -214,7 +214,7 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            auto * dev = model.dev_kv(il); // LOCAL: may differ from the layer's device
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -2025,6 +2025,32 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+// LOCAL (Inkling 2 prefill): what the CUDA flash attention needs to build the mask and the bias bin itself
+void llama_kv_cache::set_input_pos_info(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_seq_max) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == 2 && n_seq_max <= 32);
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_kv     = dst->ne[1] - n_tokens;
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    std::vector<int32_t> data(2*(n_kv + n_tokens));
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (cells.is_empty(j)) {
+            data[2*j] = -1; data[2*j + 1] = 0;
+            continue;
+        }
+        const auto & seqs = cells.seq_get_all(j);
+        uint32_t bits = 0;
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            bits |= seqs[s] ? (1u << s) : 0u;
+        }
+        data[2*j] = cells.pos_get(j); data[2*j + 1] = (int32_t) bits;
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(seq_to_stream.at(ubatch->seq_id[i][0]) == seq_to_stream.at(ubatch->seq_id[0][0]));
+        data[2*(n_kv + i)] = ubatch->pos[i]; data[2*(n_kv + i) + 1] = (int32_t) (1u << ubatch->seq_id[i][0]);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3130,6 +3156,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, rows, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_pos_info(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_seq_max) const {
+    kv->set_input_pos_info(dst, ubatch, n_seq_max);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
