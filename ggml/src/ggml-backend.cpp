@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -2210,16 +2211,47 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
+// LOCAL (2026-11-21): GGML_SCHED_TIMING=1 prints, per graph compute, copy / compute time and input bytes per split
+// backend (each split is synchronized, so this slows things down a little)
+static bool ggml_sched_timing_enabled() {
+    static const bool on = getenv("GGML_SCHED_TIMING") != nullptr;
+    return on;
+}
+static double ggml_sched_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
 
+    const bool timing = ggml_sched_timing_enabled();
+    double t_copy[GGML_SCHED_MAX_BACKENDS] = {0}, t_comp[GGML_SCHED_MAX_BACKENDS] = {0};
+    double b_in[GGML_SCHED_MAX_BACKENDS] = {0}; int n_sp[GGML_SCHED_MAX_BACKENDS] = {0};
+    double t_wall0 = timing ? ggml_sched_now_ms() : 0.0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        double t_s0 = 0.0;
+        if (timing) {
+            for (int b = 0; b < sched->n_backends; ++b) { ggml_backend_synchronize(sched->backends[b]); }
+            t_s0 = ggml_sched_now_ms();
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                const ggml_tensor * in = split->inputs[input_id];
+                b_in[split_backend_id] += (double) ggml_nbytes(in);
+                if (ggml_nbytes(in) > (1u << 20) && getenv("GGML_SCHED_TIMING")[0] == '2') {
+                    fprintf(stderr, "[sched-timing]   split %d -> %s input %s %s [%lld,%lld,%lld,%lld] %.1f MB (src backend %s)\n", split_id,
+                            ggml_backend_name(split_backend), in->name, ggml_type_name(in->type), (long long) in->ne[0], (long long) in->ne[1],
+                            (long long) in->ne[2], (long long) in->ne[3], ggml_nbytes(in)/1e6,
+                            in->buffer ? ggml_backend_buffer_name(in->buffer) : "none");
+                }
+            }
+            n_sp[split_backend_id]++;
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2249,6 +2281,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        double t_s1 = 0.0;
+        if (timing) {
+            ggml_backend_synchronize(split_backend);
+            t_s1 = ggml_sched_now_ms();
+            t_copy[split_backend_id] += t_s1 - t_s0;
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2288,12 +2326,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (timing) {
+            ggml_backend_synchronize(split_backend);
+            t_comp[split_backend_id] += ggml_sched_now_ms() - t_s1;
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (timing) {
+        fprintf(stderr, "[sched-timing] %d splits, %.1f ms wall:", sched->n_splits, ggml_sched_now_ms() - t_wall0);
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (n_sp[b]) {
+                fprintf(stderr, " | %s: %d splits, copy %.1f ms (%.1f MB in), compute %.1f ms", ggml_backend_name(sched->backends[b]),
+                        n_sp[b], t_copy[b], b_in[b]/1e6, t_comp[b]);
+            }
+        }
+        fputc('\n', stderr);
     }
 
     return GGML_STATUS_SUCCESS;
