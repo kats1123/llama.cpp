@@ -378,6 +378,15 @@ struct server_slot {
         return res;
     }
 
+    bool prompt_load_entry(server_prompt_cache & prompt_cache, std::list<server_prompt_cache_state>::iterator it) {
+        bool res = prompt_cache.load_entry(it, prompt, ctx_tgt, ctx_dft, id);
+        if (!res) {
+            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        }
+
+        return res;
+    }
+
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
@@ -905,6 +914,9 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     return 0;
 }
 
+// returned when the decode found no free space in the KV cache (nothing was decoded)
+static constexpr int32_t MTMD_CHUNK_NO_KV_SPACE = -2;
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
@@ -956,7 +968,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 );
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                    return -1;
+                    return res == 1 ? MTMD_CHUNK_NO_KV_SPACE : -1;
                 }
                 n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
                 return 0; // success
@@ -1797,7 +1809,157 @@ private:
         return nullptr;
     }
 
+    // select a slot for a chat request (--slot-select-chat):
+    // - the same chat: the idle slot or prompt cache entry that matches the request at least up to n_match tokens (the end of the first user message), the longest match wins
+    // - otherwise: an empty slot, else the least recently used idle slot
+    // a slot that is reused for another chat is saved to the prompt cache first
+    server_slot * get_available_slot_chat(const server_task & task, size_t n_match) {
+        const bool use_cache = prompt_cache && !task.is_stateless();
+
+        server_slot * slot_best = nullptr;
+        size_t lcp_slot = 0;
+
+        for (server_slot & slot : slots) {
+            if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                continue;
+            }
+
+            const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+            if (lcp >= n_match && lcp > lcp_slot) {
+                lcp_slot  = lcp;
+                slot_best = &slot;
+            }
+        }
+
+        bool cache_hit = false;
+        if (use_cache) {
+            size_t lcp_cache = 0;
+            const auto it = prompt_cache->find_longest_prefix(task.tokens, lcp_cache);
+            cache_hit = it != prompt_cache->states.end() && lcp_cache >= n_match && lcp_cache > lcp_slot;
+        }
+
+        if (slot_best != nullptr && !cache_hit) {
+            SLT_INF(*slot_best, "selected slot of the same chat, lcp = %zu, n_tokens = %d\n", lcp_slot, slot_best->prompt.n_tokens());
+            return slot_best;
+        }
+
+        const auto free_slots = get_free_slots(1, -1);
+        if (free_slots.empty()) {
+            return nullptr;
+        }
+
+        server_slot * ret = free_slots[0];
+
+        if (use_cache && ret->prompt.n_tokens() > 0) {
+            SLT_INF(*ret, "saving the slot to the prompt cache before reuse, n_tokens = %d\n", ret->prompt.n_tokens());
+            ret->prompt_save(*prompt_cache);
+        }
+
+        if (cache_hit) {
+            // search again: saving the slot can remove entries from the cache
+            size_t lcp_cache = 0;
+            auto it = prompt_cache->find_longest_prefix(task.tokens, lcp_cache);
+            if (it != prompt_cache->states.end() && lcp_cache >= n_match) {
+                SLT_INF(*ret, "loading the same chat from the prompt cache, lcp = %zu, n_tokens = %d\n", lcp_cache, it->prompt.n_tokens());
+
+                // the content of the slot is saved, free its cells for the restore
+                ret->prompt_clear();
+
+                while (!ret->prompt_load_entry(*prompt_cache, it)) {
+                    ret->prompt_clear();
+
+                    // not enough free cells: evict the least recently used idle slot and retry
+                    if (!try_clear_idle_slots()) {
+                        break;
+                    }
+
+                    SLT_WRN(*ret, "%s", "not enough free cells to load the chat, cleared an idle slot, retrying\n");
+
+                    it = prompt_cache->find_longest_prefix(task.tokens, lcp_cache);
+                    if (it == prompt_cache->states.end() || lcp_cache < n_match) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            SLT_INF(*ret, "selected empty or least recently used slot for a new chat, n_tokens = %d\n", ret->prompt.n_tokens());
+
+            share_prefix(*ret, task);
+        }
+
+        if (use_cache) {
+            prompt_cache->update();
+        }
+
+        return ret;
+    }
+
+    // start dst from the longest prefix of the request that another slot holds up to one of its checkpoints (usually the system prompt)
+    // the attention cells are shared with that slot, the recurrent state is restored from its checkpoint
+    void share_prefix(server_slot & dst, const server_task & task) {
+        // what dst can already reuse from its own content
+        int64_t n_best = 0;
+        {
+            const int64_t lcp = dst.prompt.tokens.get_common_prefix(task.tokens);
+            for (const auto & c : dst.prompt.checkpoints) {
+                if (c->n_tokens <= lcp) {
+                    n_best = std::max(n_best, c->n_tokens);
+                }
+            }
+        }
+
+        server_slot * src = nullptr;
+        std::shared_ptr<const common_prompt_checkpoint> ckpt;
+
+        for (auto & slot : slots) {
+            if (&slot == &dst || slot.prompt.tokens.empty()) {
+                continue;
+            }
+
+            const int64_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+            for (const auto & c : slot.prompt.checkpoints) {
+                if (c->n_tokens <= lcp && c->n_tokens > n_best) {
+                    n_best = c->n_tokens;
+                    src    = &slot;
+                    ckpt   = c;
+                }
+            }
+        }
+
+        if (src == nullptr) {
+            return;
+        }
+
+        const llama_pos p1 = src->prompt.tokens.pos_next(ckpt->n_tokens);
+
+        dst.prompt_clear();
+        dst.mem.seq_cp(src->id, dst.id, 0, p1);
+
+        if (!ckpt->load_tgt(ctx_tgt, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            !ckpt->load_dft(ctx_dft, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            SLT_WRN(dst, "failed to load the checkpoint of slot %d, processing the full prompt\n", src->id);
+            dst.prompt_clear();
+            return;
+        }
+
+        common_speculative_set_state(spec.get(), dst.id, ckpt->data_spec);
+
+        dst.prompt.tokens = src->prompt.tokens.clone();
+        dst.prompt.tokens.keep_first(ckpt->n_tokens);
+        dst.prompt.checkpoints.push_back(ckpt);
+
+        SLT_INF(dst, "sharing a prefix of %" PRId64 " tokens with slot %d\n", ckpt->n_tokens, src->id);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
+        if (params_base.slot_select_chat && task.id_slot == -1) {
+            for (const auto & span : task.params.message_spans.spans) {
+                if (span.role == COMMON_CHAT_ROLE_USER) {
+                    return get_available_slot_chat(task, span.pos + span.len);
+                }
+            }
+        }
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1906,36 +2068,38 @@ private:
         return ret;
     }
 
-    // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
+    // clear the least recently used idle slot, after saving it to the prompt cache (if enabled)
+    // return true if a slot has been cleared
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        server_slot * lru = nullptr;
+
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (lru == nullptr || slot.t_last_used < lru->t_last_used) {
+                lru = &slot;
             }
         }
 
-        return res;
+        if (lru == nullptr) {
+            return false;
+        }
+
+        SRV_WRN("evicting least recently used idle slot %d with %d tokens (t_last = %" PRId64 ")\n", lru->id, lru->prompt.n_tokens(), lru->t_last_used);
+
+        if (prompt_cache && lru->prompt_save(*prompt_cache)) {
+            prompt_cache->update();
+        }
+
+        lru->prompt_clear();
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2724,14 +2888,50 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_user) {
         const int id_task = slot.task->id;
+
+        bool is_prefix = false;
+
+        if (params_base.ctx_checkpoints_user) {
+            auto & ckpts = slot.prompt.checkpoints;
+
+            // the start of the first user message is the end of the system prompt
+            if (is_user) {
+                for (const auto & span : slot.task->params.message_spans.spans) {
+                    if (span.role == COMMON_CHAT_ROLE_USER) {
+                        is_prefix = (int64_t) span.pos == slot.prompt.n_tokens() - n_tokens_cur;
+                        break;
+                    }
+                }
+            }
+
+            // keep only the newest checkpoint that is not at a user message
+            if (!is_user) {
+                ckpts.remove_if([](const auto & c) { return !c->is_user; });
+            }
+
+            // when full, evict the oldest user message checkpoint; the prefix checkpoint is kept and not counted
+            const auto n_counted = [&]() { return std::count_if(ckpts.begin(), ckpts.end(), [](const auto & c) { return !c->is_prefix; }); };
+
+            while (!is_prefix && n_counted() > 0 && n_counted() >= params_base.n_ctx_checkpoints) {
+                auto it = std::find_if(ckpts.begin(), ckpts.end(), [](const auto & c) { return c->is_user && !c->is_prefix; });
+                if (it == ckpts.end()) {
+                    it = std::find_if(ckpts.begin(), ckpts.end(), [](const auto & c) { return !c->is_prefix; });
+                }
+
+                SLT_TRC(slot, "erasing old context checkpoint (n_tokens = %" PRId64 ", is_user = %d)\n", (*it)->n_tokens, (int) (*it)->is_user);
+
+                ckpts.erase(it);
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
+                !params_base.ctx_checkpoints_user &&
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
@@ -2747,7 +2947,7 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        while (!params_base.ctx_checkpoints_user && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = *slot.prompt.checkpoints.front();
 
@@ -2773,7 +2973,9 @@ private:
         auto ckpt = std::make_shared<common_prompt_checkpoint>();
         auto & cur = *ckpt;
 
-        cur.id_task = id_task;
+        cur.id_task   = id_task;
+        cur.is_user   = is_user;
+        cur.is_prefix = is_prefix;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3094,6 +3296,21 @@ private:
                                     slot.prompt_clear();
                                 }
                             }
+                        }
+                    } else if (params_base.cache_idle_after > 0 && prompt_cache && params_base.kv_unified) {
+                        // only long-idle slots: their cells in the shared KV slow down every other sequence
+                        const int64_t t_now = ggml_time_us();
+                        for (auto & s : slots) {
+                            if (s.is_processing() || s.prompt.n_tokens() == 0 || s.t_last_used < 0 ||
+                                t_now - s.t_last_used < (int64_t) params_base.cache_idle_after * 1000000) {
+                                continue;
+                            }
+                            SLT_WRN(s, "idle for %.0f s, saving %d tokens to the prompt cache and clearing the slot\n",
+                                    (t_now - s.t_last_used) / 1e6, s.prompt.n_tokens());
+                            if (s.prompt_save(*prompt_cache)) {
+                                prompt_cache->update();
+                            }
+                            s.prompt_clear();
                         }
                     }
                 } break;
@@ -4453,9 +4670,22 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
-                        });
+
+                        // a chunk that fits in one batch is not decoded at all on failure, so it can be retried after freeing space
+                        const bool can_retry = mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) <= (size_t) llama_n_batch(ctx_tgt);
+
+                        while (true) {
+                            queue_tasks.yield_to_queue([&]() {
+                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            });
+
+                            if (res == MTMD_CHUNK_NO_KV_SPACE && can_retry && try_clear_idle_slots()) {
+                                SLT_WRN(slot, "%s", "no free space in the KV cache for the mtmd chunk, cleared an idle slot, retrying\n");
+                                continue;
+                            }
+
+                            break;
+                        }
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
@@ -4527,7 +4757,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            if (params_base.ctx_checkpoints_user || pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -4597,17 +4827,22 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                    if (params_base.ctx_checkpoints_user) {
+                        // only at the start of user messages, and at the start of the last batch of the prompt
+                        do_checkpoint = do_checkpoint && (is_user_start || slot.state == SLOT_STATE_DONE_PROMPT);
+                    } else {
+                        // no need to create checkpoints that are too close together, unless it's the last user message
+                        do_checkpoint = do_checkpoint && (
+                                slot.prompt.checkpoints.empty() ||
+                                is_last_user_message || near_prompt_end ||
+                                n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_user_start);
                     }
                 }
 

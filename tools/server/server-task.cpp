@@ -1871,13 +1871,62 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
+        const bool is_full = lcp_best == (int) it_best->prompt.tokens.size();
+
+        if (!load_entry(it_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
+            return false;
+        }
+
+        // the whole cached prompt is a prefix of the new one
+        if (is_full) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+        }
+    }
+
+    return true;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_longest_prefix(const server_tokens & tokens_new, size_t & lcp_out) {
+    auto it_best = states.end();
+    lcp_out = 0;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        if (it_best == states.end() || lcp_cur > lcp_out) {
+            lcp_out = lcp_cur;
+            it_best = it;
+        }
+    }
+
+    return it_best;
+}
+
+bool server_prompt_cache::load_entry(std::list<server_prompt_cache_state>::iterator it, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    {
+        auto & data = it->data.main;
+
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+
+            return false;
+        }
+
+        data.clear();
+        data.shrink_to_fit();
+    }
+
+    {
+        auto & data = it->data.drft;
+
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
             }
@@ -1885,37 +1934,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             data.clear();
             data.shrink_to_fit();
         }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
-
-        // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
-            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
     }
+
+    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+
+    prompt = std::move(it->prompt);
+
+    states.erase(it);
 
     return true;
 }

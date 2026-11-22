@@ -1673,6 +1673,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-user"},
+        "create context checkpoints only at the start of user messages, plus one at the end of the prompt (the newest one is kept) (default: disabled)",
+        [](common_params & params) {
+            params.ctx_checkpoints_user = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-select-chat"},
+        "for requests without id_slot, select the slot or prompt cache entry that matches past the first user message; else use an empty or the least recently used slot, saving its content to the prompt cache first (default: disabled)",
+        [](common_params & params) {
+            params.slot_select_chat = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SELECT_CHAT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
@@ -1707,6 +1721,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_idle_slots = value;
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-idle-after"}, "SECONDS",
+        "with --no-cache-idle-slots: on a new task, save slots idle for at least SECONDS to the prompt cache and clear them (unified KV; an idle chat in the shared KV slows every other chat) (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-idle-after must be non-negative");
+            }
+            params.cache_idle_after = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_IDLE_AFTER").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},

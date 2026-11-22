@@ -752,6 +752,12 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // the entry with the longest common prefix with tokens_new (states.end() if empty), lcp_out is set to its length
+    std::list<server_prompt_cache_state>::iterator find_longest_prefix(const server_tokens & tokens_new, size_t & lcp_out);
+
+    // load the given entry into the slot and remove it from the cache
+    bool load_entry(std::list<server_prompt_cache_state>::iterator it, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
     void update();
 };
 
