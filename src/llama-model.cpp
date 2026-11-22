@@ -1398,6 +1398,8 @@ struct llama_model::impl {
 
     layer_dev dev_input = {};
     layer_dev dev_output = {};
+    bool dev_output_override = false; // LOCAL: set by LLAMA_LAYER_DEVICES "out="
+    std::vector<ggml_backend_dev_t> dev_kv; // LOCAL: LLAMA_KV_DEVICES overrides (nullptr = the layer's device)
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
@@ -1830,8 +1832,83 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
+    // LOCAL (2026-11-21): LLAMA_LAYER_DEVICES = "a-b=d,c=e,...,out=f" puts layers a..b (physical layers for looped
+    // models) on device d, where d indexes the -dev / device list. Ranges need not be contiguous per device.
+    if (const char * spec = getenv("LLAMA_LAYER_DEVICES"); spec && *spec && act_gpu_layers == n_layer_all + 1) {
+        std::string s(spec);
+        size_t p0 = 0;
+        while (p0 < s.size()) {
+            size_t p1 = s.find(',', p0);
+            if (p1 == std::string::npos) { p1 = s.size(); }
+            const std::string item = s.substr(p0, p1 - p0);
+            p0 = p1 + 1;
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos) { continue; }
+            const std::string range = item.substr(0, eq);
+            const int d = std::stoi(item.substr(eq + 1));
+            if (d < 0 || d >= (int) devices.size()) {
+                throw std::runtime_error(format("LLAMA_LAYER_DEVICES: device %d out of range (%zu devices)", d, devices.size()));
+            }
+            auto * dev = devices.at(d).dev;
+            const llama_model::impl::layer_dev ld = {dev, &pimpl->gpu_buft_list.at(dev)};
+            if (range == "out") {
+                pimpl->dev_output = ld; // re-applied after the output default below
+                pimpl->dev_output_override = true;
+                LLAMA_LOG_INFO("%s: LLAMA_LAYER_DEVICES: output -> %s\n", __func__, ggml_backend_dev_name(dev));
+                continue;
+            }
+            const size_t dash = range.find('-');
+            const int a = std::stoi(range.substr(0, dash));
+            const int b = dash == std::string::npos ? a : std::stoi(range.substr(dash + 1));
+            for (int il = a; il <= b && il < n_layer_all; ++il) {
+                pimpl->dev_layer[il] = ld;
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_LAYER_DEVICES: layers %d-%d -> %s\n", __func__, a, b, ggml_backend_dev_name(dev));
+        }
+    }
+
+    // LOCAL TEST (Devasy, ggml-org/llama.cpp#32718 / closed #32734): a looped Inkling 2 slot reuses the weights of its
+    // physical layer, so keep its KV and recurrent state on that layer's device (265 -> 17 graph splits on 2 GPUs)
+    if (split_mode == LLAMA_SPLIT_MODE_LAYER && act_gpu_layers == n_layer_all + 1) {
+        if (const auto * loop = dynamic_cast<const llama_model_inkling2_loop *>(this)) {
+            for (int il = loop->n_layer_phys(); il < n_layer_all; ++il) {
+                pimpl->dev_layer[il] = pimpl->dev_layer[loop->layer_phys(il)];
+            }
+        }
+    }
+
+    // LOCAL (2026-11-21): LLAMA_KV_DEVICES = "29=1,35-41=2" puts the KV cache of logical layers on another device;
+    // the attention of those layers then runs there (see build_attn_mha), the rest of the layer stays put
+    pimpl->dev_kv.assign(n_layer_all, nullptr);
+    if (const char * spec = getenv("LLAMA_KV_DEVICES"); spec && *spec && act_gpu_layers == n_layer_all + 1) {
+        std::string s2(spec);
+        size_t q0 = 0;
+        while (q0 < s2.size()) {
+            size_t q1 = s2.find(',', q0);
+            if (q1 == std::string::npos) { q1 = s2.size(); }
+            const std::string item = s2.substr(q0, q1 - q0);
+            q0 = q1 + 1;
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos) { continue; }
+            const std::string range = item.substr(0, eq);
+            const int d = std::stoi(item.substr(eq + 1));
+            if (d < 0 || d >= (int) devices.size()) {
+                throw std::runtime_error(format("LLAMA_KV_DEVICES: device %d out of range", d));
+            }
+            const size_t dash = range.find('-');
+            const int a2 = std::stoi(range.substr(0, dash));
+            const int b2 = dash == std::string::npos ? a2 : std::stoi(range.substr(dash + 1));
+            for (int il = a2; il <= b2 && il < n_layer_all; ++il) {
+                pimpl->dev_kv[il] = devices.at(d).dev;
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_KV_DEVICES: KV of layers %d-%d -> %s\n", __func__, a2, b2, ggml_backend_dev_name(devices.at(d).dev));
+        }
+    }
+
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    if (!pimpl->dev_output_override) {
+        pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2850,6 +2927,13 @@ void llama_model::print_info() const {
 }
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
+    return pimpl->dev_layer.at(il).dev;
+}
+
+ggml_backend_dev_t llama_model::dev_kv(int il) const {
+    if (il >= 0 && il < (int) pimpl->dev_kv.size() && pimpl->dev_kv[il]) {
+        return pimpl->dev_kv[il];
+    }
     return pimpl->dev_layer.at(il).dev;
 }
 
