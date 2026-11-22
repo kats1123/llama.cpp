@@ -5531,6 +5531,36 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
     return ggml_get_op_params_i32(a, 5) != 0;
 }
 
+// LOCAL (Inkling 2 prefill): see ggml.h. op params: 5 = 2 (positional), 6 = extent, 7 = n_swa, 8 = n_kv
+bool ggml_flash_attn_ext_has_positional_bias(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 5) == 2;
+}
+
+void ggml_flash_attn_ext_add_positional_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * pos_info,
+        int32_t              n_kv,
+        int32_t              extent,
+        int32_t              n_swa) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    const struct ggml_tensor * q = a->src[0];
+    GGML_ASSERT(table && pos_info && a->src[3] && !a->src[5]);
+    GGML_ASSERT(q->ne[3] == 1 && n_kv == a->src[1]->ne[1]);
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+    GGML_ASSERT((table->ne[0] == q->ne[2] || table->ne[1] == q->ne[2]) && table->ne[2] == q->ne[1] && table->ne[3] == 1);
+    GGML_ASSERT(pos_info->type == GGML_TYPE_I32 && ggml_is_contiguous(pos_info) && pos_info->ne[0] == 2);
+    GGML_ASSERT(pos_info->ne[1] == n_kv + q->ne[1]);
+    GGML_ASSERT(extent >= 0 && n_swa >= 0);
+    a->src[6] = table;
+    a->src[7] = pos_info;
+    ggml_set_op_params_i32(a, 5, 2);
+    ggml_set_op_params_i32(a, 6, extent);
+    ggml_set_op_params_i32(a, 7, n_swa);
+    ggml_set_op_params_i32(a, 8, n_kv);
+}
+
 void ggml_flash_attn_ext_add_indexed_bias(
         struct ggml_tensor * a,
         struct ggml_tensor * table,
@@ -5549,7 +5579,8 @@ void ggml_flash_attn_ext_add_indexed_bias(
     GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
     GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
-    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[1] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
+    // LOCAL: [n_heads, n_bins, n_queries], or bins-fastest [n_bins, n_heads, n_queries] (CUDA only, see ggml-cuda fattn)
+    GGML_ASSERT((table->ne[0] == q->ne[2] || table->ne[1] == q->ne[2]) && table->ne[1] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
     GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
     GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
 }

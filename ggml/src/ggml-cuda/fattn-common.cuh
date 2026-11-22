@@ -22,6 +22,35 @@ struct fattn_indexed_bias {
     const float * table;
     const int32_t * indices;
     int64_t n_bins;
+    int     bins_fastest; // LOCAL: table [n_bins, n_heads, n_queries] (native mul_mat layout) instead of [n_heads, n_bins, n_queries]
+    int     positional;   // LOCAL: indices = pos_info (see ggml_flash_attn_ext_add_positional_bias), mask not read
+    int     extent;
+    int     n_swa;
+    int     n_kv;
+    int     kv_q8;        // LOCAL: K/V are q8_0 and read directly by the MMA kernel (no F16 copy)
+};
+
+// LOCAL: index of bias(query, head, bin) in the table, for either layout
+static __device__ __forceinline__ int64_t fattn_bias_index(
+        const int64_t query, const int bin, const int head, const int64_t n_bins, const int n_heads, const bool bins_fastest) {
+    return bins_fastest ? (query*n_heads + head)*n_bins + bin : (query*n_bins + bin)*n_heads + head;
+}
+
+// LOCAL (Inkling 2 prefill speed, 2026-11-21): the indexed bias as seen by one MMA CUDA block (ncols2 == 1: one Q head).
+// bias(query, cell) = table[(query*n_bins + bin)*n_heads + head] with bin = indices[query*stride_mask + cell].
+struct fattn_mma_bias {
+    const float   * table   = nullptr;
+    const int32_t * indices = nullptr;
+    int     n_bins  = 0;
+    int     n_heads = 0;
+    int     head    = 0;
+    int64_t query0  = 0; // index of this sequence's first query in the table / indices
+    bool    bins_fastest = false;
+    bool    positional = false;
+    int     extent  = 0;
+    int     n_swa   = 0;
+    int     n_kv    = 0;
+    bool    kv_q8   = false; // K_h2/V_h2 point at q8_0 rows, stride in units of 4 bytes
 };
 
 typedef void (* fattn_kernel_t)(
@@ -90,6 +119,19 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     }
 
     return data;
+}
+
+// LOCAL (2026-11-21): the MMA kernel reads q8_0 K/V directly for the indexed-bias path (ncols2 == 1, synchronous
+// tile loads), so no F16 copy of the whole K/V view is needed. That copy is ~4 KB per cell in the compute buffer and
+// capped the Inkling 2 context. GGML_CUDA_MMA_KV_F16=1 restores the copy.
+static inline bool ggml_cuda_fattn_mma_kv_q8_direct(const ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    static const bool disabled = getenv("GGML_CUDA_MMA_KV_F16") != nullptr && atoi(getenv("GGML_CUDA_MMA_KV_F16")) != 0;
+    return !disabled && dst->src[6] != nullptr && dst->src[5] == nullptr &&
+        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        K->ne[0] % 32 == 0 && V->ne[0] % 32 == 0 &&
+        K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0;
 }
 
 template <int D, int nthreads>
@@ -1177,7 +1219,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = Q->ne[1] % ncols1 == 0 && !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    const bool scan_mask = !(dst->src[6] && ggml_flash_attn_ext_has_positional_bias(dst)) && Q->ne[1] % ncols1 == 0 && !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1333,9 +1375,14 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        // LOCAL: a table whose ne[0] is not the Q head count is in the bins-fastest layout [n_bins, n_heads, n_queries]
         fattn_indexed_bias{dst->src[6] ? (const float *) dst->src[6]->data : nullptr,
                            dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr,
-                           dst->src[6] ? dst->src[6]->ne[1] : 0}
+                           dst->src[6] ? (dst->src[6]->ne[0] != Q->ne[2] ? dst->src[6]->ne[0] : dst->src[6]->ne[1]) : 0,
+                           dst->src[6] ? int(dst->src[6]->ne[0] != Q->ne[2]) : 0,
+                           dst->src[6] ? int(ggml_flash_attn_ext_has_positional_bias(dst)) : 0,
+                           ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7), ggml_get_op_params_i32(dst, 8),
+                           int(!need_f16_K && !need_f16_V && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0)}
     );
     CUDA_CHECK(cudaGetLastError());
 

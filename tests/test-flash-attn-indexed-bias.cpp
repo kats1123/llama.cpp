@@ -5,9 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
-static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768) {
+static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, bool bins_fastest = false) {
     constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
     const int cols = use_rows ? std::min(512, cells) : cells;
 
@@ -17,7 +18,9 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
     auto * v = ggml_dup_tensor(ctx, k);
     auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cols, n_query, 1, streams);
     auto * rows = use_rows ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, streams) : nullptr;
-    auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query*streams);
+    // LOCAL: bins_fastest = the [bins, heads, queries] layout the CUDA kernels also accept
+    auto * table = bins_fastest ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, bins, heads, n_query*streams)
+                                : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query*streams);
     auto * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, n_query*streams);
     auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
     auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, 1.0f/sqrtf(width), 0, 0);
@@ -72,7 +75,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
             const int query = s*n_query + j;
             for (int h = 0; h < heads; ++h) {
                 for (int b = 0; b < bins; ++b) {
-                    biases[(query*bins + b)*heads + h] = float((b*(3 + h) + query) % 13 - 6)/2.9f;
+                    biases[bins_fastest ? (query*heads + h)*bins + b : (query*bins + b)*heads + h] = float((b*(3 + h) + query) % 13 - 6)/2.9f;
                 }
                 double sum = exp(double(sink_logits[h])), weighted = 0.0;
                 for (int c = 0; c < cols; ++c) {
@@ -84,7 +87,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
                     if (visible) {
                         const int vk = (use_rows ? 0 : s)*kv_heads + h/(heads/kv_heads);
                         const double qk = 4.0*ggml_fp16_to_fp32(keys[(vk*cells + cell)*width])/sqrt(width);
-                        const float m = 0.25f + biases[(query*bins + idx[i])*heads + h];
+                        const float m = 0.25f + biases[bins_fastest ? (query*heads + h)*bins + idx[i] : (query*bins + idx[i])*heads + h];
                         const double weight = exp(qk + ggml_fp16_to_fp32(ggml_fp32_to_fp16(m)));
                         weighted += weight*ggml_fp16_to_fp32(values[(vk*cells + cell)*width]);
                         sum += weight;
@@ -111,7 +114,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, 
         GGML_ASSERT(std::isfinite(output[i]));
         max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
     }
-    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, max_error);
+    printf("%s: width=%d, rows=%d, queries=%d, cells=%d, bins_fastest=%d, max error=%g\n", ggml_backend_name(backend), width, use_rows, n_query, cells, bins_fastest, max_error);
     GGML_ASSERT(max_error < 0.001f);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -129,6 +132,10 @@ int main() {
             for (int n_query : {1, 7, 65}) {
                 test_indexed_bias(backend, width, false, n_query);
                 test_indexed_bias(backend, width, true, n_query);
+                if (std::string(ggml_backend_name(backend)).rfind("CUDA", 0) == 0) {
+                    test_indexed_bias(backend, width, false, n_query, 768, true);
+                    test_indexed_bias(backend, width, true, n_query, 768, true);
+                }
             }
         }
         ggml_backend_free(backend);

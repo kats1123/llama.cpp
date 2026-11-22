@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool positional = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -42,7 +42,9 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int64_t nb32, const int64_t nb33,
         const fattn_indexed_bias bias) {
-    GGML_UNUSED(bias);
+    if constexpr (!positional) {
+        GGML_UNUSED(bias);
+    }
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -272,6 +274,21 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // LOCAL (Inkling 2 positional): per query position, sequence bit and the value of the pad bin (cells farther
+    // than the extent, i.e. almost all of a long context), loaded once instead of per cell
+    int   pos_q[ncols];
+    int   seq_q[ncols];
+    float pad_q[ncols];
+    if constexpr (positional) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int64_t query = int64_t(sequence)*ne01.z + ic0 + (ncols == 1 || ic0 + j < int(ne01.z) ? j : 0);
+            const int2 qp = ((const int2 *) bias.indices)[bias.n_kv + query];
+            pos_q[j] = qp.x;
+            seq_q[j] = qp.y;
+            pad_q[j] = __half2float(__float2half(bias.table[fattn_bias_index(query, bias.extent, head, bias.n_bins, ne02, bias.bins_fastest != 0)]));
+        }
+    }
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -289,6 +306,28 @@ static __global__ void flash_attn_ext_vec(
             KQ_max_new[j] = KQ_max[j];
         }
 
+        // LOCAL (Inkling 2 positional): each lane resolves the bias of the one cell it owns in this tile (coalesced
+        // pos_info load), the KQ loop below fetches it from the owning lane with a shuffle
+        float m_own[ncols];
+        if constexpr (positional) {
+            const int cell = k_VKQ_0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+            const int2 kv  = cell < ne11 ? ((const int2 *) bias.indices)[cell] : make_int2(-1, 0);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const int d = pos_q[j] - kv.x;
+                float m = -INFINITY;
+                if (kv.x >= 0 && (kv.y & seq_q[j]) != 0 && d >= 0 && (bias.n_swa == 0 || d < bias.n_swa)) {
+                    if (d < bias.extent) {
+                        const int64_t query = int64_t(sequence)*ne01.z + ic0 + (ncols == 1 || ic0 + j < int(ne01.z) ? j : 0);
+                        m = __half2float(__float2half(bias.table[fattn_bias_index(query, d, head, bias.n_bins, ne02, bias.bins_fastest != 0)]));
+                    } else {
+                        m = pad_q[j];
+                    }
+                }
+                m_own[j] = slope*m;
+            }
+        }
+
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
@@ -302,7 +341,13 @@ static __global__ void flash_attn_ext_vec(
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                if constexpr (positional) {
+                    // LOCAL (Inkling 2): visibility + bias bin from positions; the mask is a placeholder
+                    const float m = __shfl_sync(0xFFFFFFFF, m_own[j], i_KQ - threadIdx.y*WARP_SIZE, WARP_SIZE);
+                    if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                        sum += m;
+                    }
+                } else if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
@@ -555,13 +600,13 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool positional = false>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, positional>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
@@ -575,6 +620,19 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+    // LOCAL (Inkling 2): positional bias variant, only compiled for the head sizes that use it
+    if constexpr (D == 64 || D == 128) {
+        if (dst->src[6] && ggml_flash_attn_ext_has_positional_bias(dst)) {
+            GGML_ASSERT(logit_softcap == 0.0f);
+            if (Q->ne[1] == 1) {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false, true>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, type_K, type_V, false, true>(ctx, dst);
+            }
+            return;
+        }
+    }
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;

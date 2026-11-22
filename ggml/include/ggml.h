@@ -2292,6 +2292,21 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    // LOCAL (Inkling 2 prefill, 2026-11-21): the mask AND the bias bin computed in the kernel from positions.
+    // pos_info: I32 [2, n_kv + n_queries]: rows 0..n_kv-1 = (cell pos or -1 if empty, sequence bit mask),
+    // then one row per query = (query pos, 1 << seq_id). A cell is visible to a query if it is not empty, shares a
+    // sequence, cell pos <= query pos and (n_swa == 0 or query pos - cell pos < n_swa); its bin is
+    // min(query pos - cell pos, extent). The mask passed to the op is a placeholder and is not read. Single stream.
+    GGML_API void ggml_flash_attn_ext_add_positional_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos_info,
+            int32_t              n_kv,
+            int32_t              extent,
+            int32_t              n_swa);
+
+    GGML_API bool ggml_flash_attn_ext_has_positional_bias(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

@@ -217,6 +217,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     are put into the template specialization without GQA optimizations.
     // a mask with a head dimension is not shared by the Q heads of a K/V head
     bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // LOCAL: the indexed bias is per Q head, so no GQA grouping (ncols2 must be 1, see fattn_mma_bias)
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        use_gqa_opt = false;
+    }
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -671,6 +675,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
         const float softcap = ggml_get_op_params_f32(dst, 2);
+        // LOCAL (Inkling 2 prefill speed): the MMA kernel reads the indexed bias with one Q head per block (ncols2 == 1).
+        // Not for kv_rows (the tile kernel handles those). GGML_CUDA_INDEXED_BIAS_TILE=1 forces the tile kernel for A/B tests.
+        static const bool force_tile = getenv("GGML_CUDA_INDEXED_BIAS_TILE") != nullptr;
+        const bool mma_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && !kv_rows && softcap == 0.0f &&
+                (Q->ne[0] == 64 || Q->ne[0] == 128);
+        if (ggml_flash_attn_ext_has_positional_bias(dst)) {
+            // positional: the vec kernel for 1-2 tokens (decode), the MMA kernel for bigger batches
+            if (mma_ok && Q->ne[1] <= 2 && K->ne[1] % FATTN_KQ_STRIDE == 0 && getenv("GGML_CUDA_POSITIONAL_NO_VEC") == nullptr) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            return mma_ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+        }
+        if (!force_tile && mma_ok) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         return (Q->ne[0] == 128 || (Q->ne[0] == 64 && softcap == 0.0f)) ? BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
     }
 
@@ -804,9 +823,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !ggml_cuda_fattn_mma_kv_q8_direct(dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
